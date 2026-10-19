@@ -1,0 +1,9 @@
+# Build tuning for this engine.
+#
+# target-cpu=native lets the compiler use every ISA extension of the machine
+# doing the build: PEXT (BMI2) for slider attacks, AVX2 for the NNUE. The
+# resulting binary is NOT portable: build on the box you run on, or pick a
+# target with the Makefile (`make ARCH=x86-64-v3`) or
+# `RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release`.
+[build]
+rustflags = ["-C", "target-cpu=native"]
