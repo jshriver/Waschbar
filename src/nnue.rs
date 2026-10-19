@@ -555,7 +555,9 @@ impl EvalCache {
 // are widened into i64 totals every FLUSH_PAIRS pairs (the const assert keeps
 // that inside i32). The result equals the plain i64 sum exactly
 // (`l1_forward_matches_dense`, `forward_pass_matches_scalar`). The AVX2
-// version fuses the SCReLU into the nonzero scan, one pass over the inputs.
+// version squares all inputs in the nonzero scan, 16 at a time, so the
+// per-pair loop is just a broadcast and two madds: on Haswell the multiply,
+// shift and madds all compete for port 0, and squaring per pair cost ~18%.
 //
 // x86_64: AVX2 when the target is built for it (`-C target-cpu=native` sets
 // this), else a runtime `is_x86_feature_detected!` check. aarch64: NEON,
@@ -715,77 +717,66 @@ unsafe fn l1_forward_avx2(us: &[i16; HL], them: &[i16; HL], w: &[i16], out: &mut
     let zero = _mm256_setzero_si256();
     let qa = _mm256_set1_epi16(QA_I16);
 
-    // i64 totals: outputs 0-3, 4-7, 8-11, 12-15
-    let mut t = [zero; 4];
-    // i32 partial sums: outputs 0-7, 8-15
-    let mut a0 = zero;
-    let mut a1 = zero;
-
-    // widen the i32 partial sums into the i64 totals
-    macro_rules! widen {
-        () => {
-            t[0] = _mm256_add_epi64(t[0], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(a0)));
-            t[1] = _mm256_add_epi64(t[1], _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(a0)));
-            t[2] = _mm256_add_epi64(t[2], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(a1)));
-            t[3] = _mm256_add_epi64(t[3], _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(a1)));
-        };
-    }
-
-    // The list is left uninitialised: pass 1 writes every entry pass 2
-    // reads (zero-filling it cost ~2% of search).
-    let mut list = MaybeUninit::<[u16; HL / 2 + 8]>::uninit();
+    #[repr(C, align(64))]
+    struct Sq([i16; 2 * HL]);
+    // Both buffers are fully written by pass 1 before pass 2 reads them.
+    let mut sq = MaybeUninit::<Sq>::uninit();
+    let sqp = sq.as_mut_ptr() as *mut i16;
+    let mut list = MaybeUninit::<[u16; HL + 8]>::uninit();
     let lp = list.as_mut_ptr() as *mut u16;
 
+    // Pass 1: SCReLU all 2*HL inputs 16 at a time (clamp, square, halve),
+    // store them, and list the nonzero input pairs branch-free. Squaring
+    // here instead of per pair in pass 2 takes the multiply and shift off
+    // port 0, which pass 2's madds saturate on Haswell.
+    let mut count = 0usize;
     for (half, src) in [us, them].into_iter().enumerate() {
         let sp = src.as_ptr();
-
-        // Pass 1: list this half's nonzero input pairs, branch-free. A pair
-        // is nonzero after the clamp iff either value is > 0. Each block of
-        // 8 pairs gives an 8-bit mask; its LUT entry (plus the block's base)
-        // is stored unconditionally and the list grows by the popcount.
-        // Four blocks per step, masks and popcounts computed side by side,
-        // so the only serial chain is the running offset (one add a block).
-        let mut count = 0usize;
         for step in 0..HL / 64 {
             let mut m = [0usize; 4];
             for (b, mb) in m.iter_mut().enumerate() {
-                let v = _mm256_loadu_si256(sp.add(step * 64 + b * 16) as *const __m256i);
-                let pos = _mm256_cmpgt_epi16(v, zero);
-                let zmask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(pos, zero)));
-                *mb = !zmask as usize & 0xFF;
+                let i = step * 64 + b * 16;
+                let c = _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256(sp.add(i) as *const __m256i), zero), qa);
+                // c^2 <= 65025 fits u16; the logical shift halves it exactly.
+                let v = _mm256_srli_epi16::<1>(_mm256_mullo_epi16(c, c));
+                _mm256_store_si256(sqp.add(half * HL + i) as *mut __m256i, v);
+                // a pair (one i32 lane) is nonzero iff either square is
+                *mb = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, zero))) as usize;
             }
             for (b, &mb) in m.iter().enumerate() {
                 let idx = _mm_add_epi16(
                     _mm_loadu_si128(NZ_LUT[mb].as_ptr() as *const __m128i),
-                    _mm_set1_epi16((step * 32 + b * 8) as i16),
+                    _mm_set1_epi16(((half * HL + step * 64 + b * 16) / 2) as i16),
                 );
                 _mm_storeu_si128(lp.add(count) as *mut __m128i, idx);
                 count += mb.count_ones() as usize;
             }
         }
+    }
 
-        // Pass 2: SCReLU each listed pair (clamp, square, halve) and add it
-        // to all 16 outputs; widen to i64 every FLUSH_PAIRS pairs.
-        // (acc[2p], acc[2p+1]) as one 32-bit lane; `sp` is only 2-aligned.
-        let pairs = sp as *const i32;
-        let wh = w.as_ptr().add(half * (HL / 2) * 2 * L2);
-        let mut k = 0;
-        while k < count {
-            let end = (k + FLUSH_PAIRS).min(count);
-            while k < end {
-                let p = *lp.add(k) as usize;
-                let cl = _mm256_min_epi16(_mm256_max_epi16(_mm256_set1_epi32(pairs.add(p).read_unaligned()), zero), qa);
-                // cl^2 <= 65025 fits u16; the logical shift halves it exactly.
-                let cp = _mm256_srli_epi16::<1>(_mm256_mullo_epi16(cl, cl));
-                let row = wh.add(p * 2 * L2) as *const __m256i;
-                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(cp, _mm256_loadu_si256(row)));
-                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(cp, _mm256_loadu_si256(row.add(1))));
-                k += 1;
-            }
-            widen!();
-            a0 = zero;
-            a1 = zero;
+    // Pass 2: add each listed pair to all 16 outputs; widen the i32 lanes
+    // to i64 totals every FLUSH_PAIRS pairs.
+    let pairs = sqp as *const i32;
+    let wp = w.as_ptr();
+    let mut t = [zero; 4];
+    let (mut a0, mut a1) = (zero, zero);
+    let mut k = 0;
+    while k < count {
+        let end = (k + FLUSH_PAIRS).min(count);
+        while k < end {
+            let p = *lp.add(k) as usize;
+            let cp = _mm256_set1_epi32(*pairs.add(p));
+            let row = wp.add(p * 2 * L2) as *const __m256i;
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(cp, _mm256_loadu_si256(row)));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(cp, _mm256_loadu_si256(row.add(1))));
+            k += 1;
         }
+        t[0] = _mm256_add_epi64(t[0], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(a0)));
+        t[1] = _mm256_add_epi64(t[1], _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(a0)));
+        t[2] = _mm256_add_epi64(t[2], _mm256_cvtepi32_epi64(_mm256_castsi256_si128(a1)));
+        t[3] = _mm256_add_epi64(t[3], _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(a1)));
+        a0 = zero;
+        a1 = zero;
     }
     for (k, v) in t.iter().enumerate() {
         _mm256_storeu_si256(out.as_mut_ptr().add(k * 4) as *mut __m256i, *v);
@@ -1045,9 +1036,7 @@ pub fn evaluate_with_net(net: &Net, acc: &DualAccumulator, stm: usize, piece_cou
 fn float_layers(net: &Net, ob: usize, s: &[i64; L2]) -> i32 {
     let l1b = &net.l1b[ob * L2..(ob + 1) * L2];
     let mut h2 = [0f32; L2];
-    for o in 0..L2 {
-        h2[o] = screlu_f((s[o] as f64 * L1_SCALE) as f32 + l1b[o]);
-    }
+    l1_activate(s, l1b, &mut h2);
 
     // L2 -> L3 -> 1 in f32. Each L3 sum still adds its terms in input order
     // (bias, then o = 0..L2), but all L3 sums advance together, so the loop
@@ -1066,6 +1055,43 @@ fn float_layers(net: &Net, ob: usize, s: &[i64; L2]) -> i32 {
     }
 
     (out * SCALE as f32) as i32
+}
+
+/// `h2[o] = screlu_f((s[o] as f64 * L1_SCALE) as f32 + l1b[o])`: the 2*HL -> L2
+/// layer's integer sums to its float activations. The AVX2 version is bit-identical.
+#[inline]
+fn l1_activate(s: &[i64; L2], l1b: &[f32], h2: &mut [f32; L2]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe { return l1_activate_avx2(s, l1b, h2) }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    if std::is_x86_feature_detected!("avx2") {
+        unsafe { return l1_activate_avx2(s, l1b, h2) }
+    }
+    #[allow(unreachable_code)]
+    for o in 0..L2 {
+        h2[o] = screlu_f((s[o] as f64 * L1_SCALE) as f32 + l1b[o]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn l1_activate_avx2(s: &[i64; L2], l1b: &[f32], h2: &mut [f32; L2]) {
+    use std::arch::x86_64::*;
+    debug_assert!(l1b.len() >= L2);
+    // Exact i64 -> f64 for |x| < 2^51 (the sums stay below 2^34): add the
+    // bits of 2^52 + 2^51 as an integer, reinterpret, subtract it as a double.
+    let magic_i = _mm256_set1_epi64x(0x4338_0000_0000_0000);
+    let magic_d = _mm256_set1_pd(f64::from_bits(0x4338_0000_0000_0000));
+    let scale = _mm256_set1_pd(L1_SCALE);
+    let (zero, one) = (_mm_setzero_ps(), _mm_set1_ps(1.0));
+    for q in 0..L2 / 4 {
+        let x = _mm256_loadu_si256(s.as_ptr().add(q * 4) as *const __m256i);
+        let d = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_add_epi64(x, magic_i)), magic_d);
+        let f = _mm_add_ps(_mm256_cvtpd_ps(_mm256_mul_pd(d, scale)), _mm_loadu_ps(l1b.as_ptr().add(q * 4)));
+        let c = _mm_min_ps(_mm_max_ps(f, zero), one);
+        _mm_storeu_ps(h2.as_mut_ptr().add(q * 4), _mm_mul_ps(c, c));
+    }
 }
 
 /// `x[j] += w[o][j] * h[o]` for o = 0..L2 in order, then
@@ -1342,6 +1368,30 @@ mod tests {
             ("4k3/8/8/8/8/8/8/QQQQK3 b - - 0 1", -2048),
         ] {
             assert_eq!(evaluate_full(&pos_from(fen)), want, "{fen}");
+        }
+    }
+
+    /// The SIMD activation of the L2 sums must equal the scalar formula bit for bit,
+    /// across the whole range of the sums (including negatives and the clamp edges).
+    #[test]
+    fn l1_activate_matches_scalar() {
+        let mut st: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for trial in 0..2000 {
+            let span = [1i64 << 12, 1 << 22, 1 << 33][trial % 3];
+            let s: [i64; L2] = std::array::from_fn(|_| (next() % (2 * span as u64)) as i64 - span);
+            let l1b: Vec<f32> = (0..L2).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let mut got = [0f32; L2];
+            l1_activate(&s, &l1b, &mut got);
+            for o in 0..L2 {
+                let want = screlu_f((s[o] as f64 * L1_SCALE) as f32 + l1b[o]);
+                assert_eq!(got[o].to_bits(), want.to_bits(), "s={} b={}", s[o], l1b[o]);
+            }
         }
     }
 
