@@ -1,0 +1,201 @@
+name: Release
+
+# Runs only when a version tag is pushed: git tag v1.2.0 && git push origin v1.2.0
+# The tag must match the version in Cargo.toml (it is the engine's `id name`).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries: no debug info, stripped (Cargo.toml keeps debug info for profiling).
+  CARGO_PROFILE_RELEASE_DEBUG: 'false'
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  version:
+    name: Check tag matches Cargo.toml
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml: $version, tag: $tag"
+          [ "$version" = "$tag" ] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.os }} ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: static musl binaries, run on any distribution
+          - { os: linux,   arch: x86-64-v1, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  cpu: x86-64 }
+          - { os: linux,   arch: x86-64-v2, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  cpu: x86-64-v2 }
+          - { os: linux,   arch: x86-64-v3, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  cpu: x86-64-v3 }
+          - { os: linux,   arch: x86-64-v4, runner: ubuntu-24.04,     target: x86_64-unknown-linux-musl,  cpu: x86-64-v4 }
+          - { os: linux,   arch: armv8,     runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, cpu: generic }
+          # Windows
+          - { os: windows, arch: x86-64-v1, runner: windows-latest,   target: x86_64-pc-windows-msvc,     cpu: x86-64 }
+          - { os: windows, arch: x86-64-v2, runner: windows-latest,   target: x86_64-pc-windows-msvc,     cpu: x86-64-v2 }
+          - { os: windows, arch: x86-64-v3, runner: windows-latest,   target: x86_64-pc-windows-msvc,     cpu: x86-64-v3 }
+          - { os: windows, arch: x86-64-v4, runner: windows-latest,   target: x86_64-pc-windows-msvc,     cpu: x86-64-v4 }
+          - { os: windows, arch: armv8,     runner: windows-11-arm,   target: aarch64-pc-windows-msvc,    cpu: generic }
+          # macOS
+          - { os: macos,   arch: x86-64-v1, runner: macos-15-intel,   target: x86_64-apple-darwin,        cpu: x86-64 }
+          - { os: macos,   arch: x86-64-v2, runner: macos-15-intel,   target: x86_64-apple-darwin,        cpu: x86-64-v2 }
+          - { os: macos,   arch: x86-64-v3, runner: macos-15-intel,   target: x86_64-apple-darwin,        cpu: x86-64-v3 }
+          - { os: macos,   arch: x86-64-v4, runner: macos-15-intel,   target: x86_64-apple-darwin,        cpu: x86-64-v4 }
+          - { os: macos,   arch: armv8,     runner: macos-15,         target: aarch64-apple-darwin,       cpu: apple-m1 }
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Overrides `target-cpu=native` from .cargo/config.toml.
+      RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
+      EXE: waschbar${{ matrix.os == 'windows' && '.exe' || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/release/$EXE" .
+          ls -l "$EXE"
+
+      - name: Check whether this runner can execute the build
+        id: cpu
+        run: |
+          RUSTFLAGS= rustc -O -o cpu-level .github/cpu-level.rs
+          best=$(./cpu-level)
+          want="${{ matrix.arch }}"
+          case "$want:$best" in
+            armv8:armv8) run=yes ;;
+            x86-64-v*:x86-64-v*) [ "${best#x86-64-v}" -ge "${want#x86-64-v}" ] && run=yes || run=no ;;
+            *) run=no ;;
+          esac
+          echo "Runner CPU: $best, build: $want -> run tests: $run"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests
+        if: steps.cpu.outputs.run == 'yes'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Perft
+        if: steps.cpu.outputs.run == 'yes'
+        run: |
+          out=$(printf '%s\n' \
+            'position startpos' 'perft 5' \
+            'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1' 'perft 4' \
+            'setoption name UCI_Chess960 value true' \
+            'position fen bqnb1rkr/pp3ppp/3ppn2/2p5/5P2/P2P4/NPP1P1PP/BQ1BNRKR w HFhf - 2 9' 'perft 4' \
+            'quit' | "./$EXE")
+          echo "$out"
+          got=$(echo "$out" | tr -d '\r' | awk '/^nodes/ { printf "%s ", $2 }')
+          [ "$got" = "4865609 4085603 326672 " ] || { echo "::error::perft mismatch: $got"; exit 1; }
+
+      - name: Bench
+        if: steps.cpu.outputs.run == 'yes'
+        run: |
+          "./$EXE" bench 13 | tr -d '\r' | tee bench.log
+          nodes=$(awk '/^bench:/ { print $2 }' bench.log)
+          [ -n "$nodes" ] || { echo "::error::no bench output"; exit 1; }
+          mkdir -p bench
+          echo "${{ matrix.os }}-${{ matrix.arch }} $nodes" > "bench/${{ matrix.os }}-${{ matrix.arch }}.txt"
+
+      - name: Upload bench result
+        if: steps.cpu.outputs.run == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.arch }}
+          path: bench/
+
+      - name: Package
+        run: |
+          pkg="waschbar-${{ needs.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg"
+          if [ "${{ matrix.os }}" = windows ]; then
+            cp "$EXE" "dist/$pkg/$pkg.exe"
+          else
+            cp "$EXE" "dist/$pkg/$pkg"
+          fi
+          cp README.md LICENSE waschbar.png "dist/$pkg/"
+          cd dist
+          if [ "${{ matrix.os }}" = windows ]; then
+            7z a "$pkg.zip" "$pkg" > /dev/null
+          else
+            tar -czf "$pkg.tar.gz" "$pkg"
+          fi
+          rm -rf "$pkg"
+          ls -l
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: waschbar-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  # Every build that could run must play identically: same bench node count.
+  consistency:
+    name: Bench node counts agree
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          merge-multiple: true
+          path: bench
+      - name: Compare bench node counts
+        run: |
+          {
+            echo "| Build | Bench nodes |"
+            echo "|---|---|"
+            cat bench/*.txt | sort | awk '{ print "| " $1 " | " $2 " |" }'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat bench/*.txt
+          distinct=$(cat bench/*.txt | awk '{ print $2 }' | sort -u | wc -l)
+          if [ "$distinct" -ne 1 ]; then
+            echo "::error::builds disagree on the bench node count"
+            exit 1
+          fi
+
+  release:
+    name: Publish release
+    needs: [version, build, consistency]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: waschbar-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "Waschbar ${{ needs.version.outputs.version }}" --generate-notes
+          fi

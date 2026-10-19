@@ -85,6 +85,30 @@ RUSTFLAGS="-C target-cpu=x86-64-v4" cargo build --release   # AVX-512
 The version is the `version` field in `Cargo.toml`, and appears in the engine's `id name`
 (`version = "1.1.2"` → `id name Waschbar 1.1.2`).
 
+### Releases
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs when a version tag is
+pushed. The tag must match `Cargo.toml` (tag `v1.1.2` for version `1.1.2`):
+
+```sh
+git tag v1.1.2
+git push origin v1.1.2
+```
+
+It builds 15 binaries:
+
+| | x86-64-v1 | x86-64-v2 | x86-64-v3 | x86-64-v4 | ARM64 |
+|---|---|---|---|---|---|
+| Linux (static, musl) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Windows | ✓ | ✓ | ✓ | ✓ | ✓ |
+| macOS | ✓ | ✓ | ✓ | ✓ | ✓ (Apple Silicon) |
+
+Pick the highest x86-64 level your CPU supports: v1 runs on any 64-bit x86, v2 needs SSE4.2
+and POPCNT (2009+), v3 needs AVX2 and BMI2 (Intel Haswell / AMD Zen 1+; fastest on Zen 3+),
+v4 needs AVX-512. Each build runs the unit tests, perft and `bench` when the runner's CPU can
+execute it, and the release is only published if every tested build reports the same bench
+node count.
+
 ## UCI options
 
 | Option | Type | Default | Description |

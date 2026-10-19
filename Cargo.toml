@@ -1,6 +1,6 @@
 [package]
 name = "waschbar"
-version = "1.1.2"
+version = "1.1.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Waschbar: UCI chess engine with NNUE evaluation (Rust port of the original C++ Waschbar)"
